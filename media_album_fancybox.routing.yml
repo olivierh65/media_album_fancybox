@@ -1,0 +1,32 @@
+media_album_fancybox.status:
+  path: '/album-gallery/status/{token}'
+  defaults:
+    _controller: '\Drupal\media_album_fancybox\Controller\AlbumGalleryStatusController::status'
+  requirements:
+    _permission: 'access content'
+
+media_album_fancybox.menu_open:
+  path: '/album-gallery/event/{term_id}'
+  defaults:
+    _controller: '\Drupal\media_album_fancybox\Controller\AlbumGalleryStatusController::menuOpen'
+    view_id: 'media_album_av'
+    display_id: 'media_album_av'
+  requirements:
+    _permission: 'access content'
+    term_id: '\d+|all'
+
+media_album_fancybox.render:
+  path: '/album-gallery/render/{view_id}/{display_id}/{term_id}'
+  defaults:
+    _controller: '\Drupal\media_album_fancybox\Controller\AlbumGalleryStatusController::renderView'
+  requirements:
+    _permission: 'access content'
+    term_id: '\d+|all'
+
+media_album_fancybox.cleanup:
+  path: '/album-gallery/cleanup/{token}'
+  defaults:
+    _controller: '\Drupal\media_album_fancybox\Controller\AlbumGalleryStatusController::cleanup'
+  requirements:
+    _permission: 'access content'
+  methods: [DELETE, POST]

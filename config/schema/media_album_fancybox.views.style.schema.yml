@@ -1,0 +1,29 @@
+views.style.media_album_fancybox_gallery:
+  type: views_style
+  label: 'Media Album Fancybox gallery'
+  mapping:
+    image:
+      type: mapping
+      label: 'Image settings'
+      mapping:
+        image_field:
+          type: string
+          label: 'Image field'
+        image_thumbnail_style:
+          type: string
+          label: 'Thumbnail image style'
+        captions:
+          type: boolean
+          label: 'Display captions'
+        title_field:
+          type: string
+          label: 'Title field'
+        author_field:
+          type: string
+          label: 'Author field'
+        description_field:
+          type: string
+          label: 'Description field'
+        url_field:
+          type: string
+          label: 'URL field'

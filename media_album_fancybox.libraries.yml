@@ -1,0 +1,29 @@
+fancybox:
+  version: 1.x
+  css:
+    theme:
+      https://cdn.jsdelivr.net/npm/@fancyapps/ui/dist/fancybox.css: { type: external }
+      css/fancybox.css: {}
+  js:
+    https://cdn.jsdelivr.net/npm/@fancyapps/ui/dist/fancybox.umd.js: { type: external }
+    js/fancybox.js: {}
+    js/image-throttle.js: {}
+  dependencies:
+    - core/drupal
+    - core/drupalSettings
+    - core/once
+
+album_gallery_progress:
+  version: 1.x
+  js:
+    js/album-gallery-progress.js: {}
+  css:
+    component:
+      css/album-gallery-progress.css: {}
+  dependencies:
+    - core/jquery
+    - core/drupal
+    - core/once
+    - core/drupalSettings
+    - core/drupal.dialog.ajax
+    - core/drupal.ajax

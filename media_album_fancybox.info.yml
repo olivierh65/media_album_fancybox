@@ -1,0 +1,14 @@
+name: 'Media Album Fancybox'
+type: module
+description: 'Displays media albums with a Fancybox gallery and AJAX progress.'
+package: Media
+core_version_requirement: ^10 || ^11
+
+dependencies:
+  - drupal:datetime
+  - drupal:field
+  - drupal:file
+  - drupal:image
+  - drupal:media
+  - drupal:views
+  - media_album_av_common

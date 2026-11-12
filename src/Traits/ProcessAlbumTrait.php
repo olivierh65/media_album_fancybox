@@ -1,0 +1,1238 @@
+<?php
+
+namespace Drupal\media_album_fancybox\Traits;
+
+use Drupal\datetime\Plugin\Field\FieldType\DateTimeItem;
+use Drupal\file\FileInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\media\MediaInterface;
+use Drupal\image\Entity\ImageStyle;
+use Drupal\views\Plugin\views\field\EntityField;
+use Drupal\field\Entity\FieldStorageConfig;
+
+/**
+ * Provides reusable logic for albums.
+ */
+trait ProcessAlbumTrait {
+
+  /**
+   * Get the dimensions of an image style.
+   */
+  private function getImageStyleDimensions(string $style_name): array {
+    $max_width = NULL;
+
+    $max_height = NULL;
+    if (!empty($style_name)) {
+      $image_style = ImageStyle::load($style_name);
+      if ($image_style) {
+        $effects = $image_style->getEffects();
+        foreach ($effects as $effect) {
+          $conf = $effect->getConfiguration();
+          if ($conf['id'] === 'image_scale' || $conf['id'] === 'image_scale_and_crop') {
+            $max_width = $conf['data']['width'] ?? NULL;
+            $max_height = $conf['data']['height'] ?? NULL;
+            break;
+          }
+        }
+      }
+    }
+    return ['width' => $max_width, 'height' => $max_height];
+  }
+
+  /**
+   * Recursively process the grouping structure from Views.
+   *
+   * @param array $groups
+   *   The grouping structure returned by renderGrouping().
+   * @param array &$build
+   *   The build array (passed by reference to add settings).
+   * @param array &$album_settings
+   *   The album settings (passed by reference to collect).
+   * @param int $depth
+   *   Current depth (for debug/styling).
+   *
+   * @return array
+   *   Normalized structure for Twig.
+   */
+  private function processGroupRecursive(array $groups, array &$build, array &$album_settings, int $depth = 0, $idx = 0, array $preloaded_medias = []) {
+
+    $processed = [];
+
+    foreach ($groups as $group_key => $group_data) {
+      $idx = rand();
+      $group_item = [
+        'title' => $group_data['group'] ?? '',
+        'level' => $group_data['level'] ?? $depth,
+        'albums' => [],
+        'subgroups' => [],
+        'groupid' => 'album-group-' . $idx,
+      ];
+
+      if (isset($group_data['rows']) && is_array($group_data['rows'])) {
+        $first_row = reset($group_data['rows']);
+
+        // Détection fiable : sous-groupe = array avec clé 'rows'
+        // ResultRow réelle = objet.
+        if (is_array($first_row) && array_key_exists('rows', $first_row)) {
+          $group_item['subgroups'] = $this->processGroupRecursive(
+            $group_data['rows'],
+            $build,
+            $album_settings,
+            $depth + 1,
+            $idx,
+            $preloaded_medias
+          );
+        }
+        else {
+          $r = $this->buildAlbumDataFromGroup(
+            $group_data['rows'],
+            $idx,
+            $album_settings,
+            $preloaded_medias
+          );
+          if ($r) {
+            $group_item['albums'][] = $r;
+          }
+        }
+      }
+      $processed[] = $group_item;
+    }
+
+    return $processed;
+  }
+
+  /**
+   * Build album data from grouped rows.
+   *
+   * @param array $rows
+   *   Array of rows in the same group.
+   * @param int $group_index
+   *   The group index.
+   * @param array $album_group_settings
+   *   The album settings (passed by reference to collect).
+   *
+   * @return array|null
+   *   The album data or NULL on error.
+   */
+  private function buildAlbumDataFromGroup($rows, $group_index, array &$album_group_settings, array $preloaded_medias = []): ?array {
+
+    $first_row = NULL;
+
+    foreach ($rows as $index => $row) {
+      if (!empty($row->_entity)) {
+        $first_row = $row;
+        break;
+      }
+    }
+
+    if (!$first_row) {
+      return NULL;
+    }
+
+    $parent_entity = $first_row->_entity;
+
+    // Extraire les IDs de médias depuis les relationship entities des rows
+    // de CE groupe (chaque row a un média spécifique via le JOIN SQL).
+    $group_media_ids = [];
+    foreach ($rows as $row) {
+      if (isset($row->_relationship_entities) && is_array($row->_relationship_entities)) {
+        foreach ($row->_relationship_entities as $rel_entity) {
+          if ($rel_entity instanceof MediaInterface) {
+            $mid = (int) $rel_entity->id();
+            $group_media_ids[$mid] = $mid;
+            break;
+          }
+        }
+      }
+    }
+
+    // Préserver l'ordre défini par l'utilisateur dans le champ médias du node.
+    // On reconstruit une liste ordonnée des MIDs du groupe selon les deltas.
+    $ordered_group_media_ids = [];
+    if (!empty($group_media_ids)
+      && $parent_entity->hasField('field_media_album_av_media')) {
+      foreach ($parent_entity->get('field_media_album_av_media')->getValue() as $item) {
+        $mid = (int) ($item['target_id'] ?? 0);
+        if ($mid && isset($group_media_ids[$mid])) {
+          $ordered_group_media_ids[$mid] = $mid;
+        }
+      }
+      // Sécurité: ajoute les MIDs restants qui ne seraient pas dans la liste.
+      foreach ($group_media_ids as $mid) {
+        if (!isset($ordered_group_media_ids[$mid])) {
+          $ordered_group_media_ids[$mid] = $mid;
+        }
+      }
+    }
+    else {
+      $ordered_group_media_ids = $group_media_ids;
+    }
+
+    // Récupération des médias : filtrer les pré-chargés par les IDs du groupe.
+    $media_entities = [];
+    if (!empty($ordered_group_media_ids) && !empty($preloaded_medias)) {
+      foreach ($ordered_group_media_ids as $mid) {
+        if (isset($preloaded_medias[$mid])) {
+          $media_entities[] = $preloaded_medias[$mid];
+        }
+      }
+    }
+    elseif (!empty($ordered_group_media_ids)) {
+      $media_entities = array_values(
+        \Drupal::entityTypeManager()->getStorage('media')->loadMultiple($ordered_group_media_ids)
+      );
+    }
+
+    // Fallback : lecture depuis le champ de l'entité parente.
+    if (empty($media_entities)) {
+      $seen = [];
+      foreach ($rows as $row) {
+        if (empty($row->_entity) || !$row->_entity->hasField('field_media_album_av_media')) {
+          continue;
+        }
+        foreach ($row->_entity->get('field_media_album_av_media')->referencedEntities() as $media) {
+          $mid = (int) $media->id();
+          if (!isset($seen[$mid])) {
+            $seen[$mid] = TRUE;
+            $media_entities[] = $media;
+          }
+        }
+      }
+    }
+
+    if (empty($media_entities)) {
+      return NULL;
+    }
+
+    // Champs texte directement depuis l'entité — pas de rendu Views.
+    $title = $parent_entity->label();
+    // @todo les champs de description et d'auteur devraient être configurables, pas codés en dur.
+    $description = $parent_entity->hasField('field_media_album_av_description')
+      ? ($parent_entity->get('field_media_album_av_description')->value ?? '')
+      : '';
+    // @todo verifier la recuperation des auteurs.
+    $author = $this->getNodeAuthors($parent_entity);
+
+    // Caption: read configured caption field from per-node grouping config.
+    $caption = '';
+    $media_caption_config = '';
+    if (isset($this->groupingConfigService)) {
+      $caption_config = $this->groupingConfigService->getNodeCaptionFieldConfig($parent_entity);
+      $caption = $this->resolveCaptionValue($parent_entity, $caption_config);
+      $media_caption_config = $this->groupingConfigService->getNodeMediaCaptionFieldConfig($parent_entity);
+    }
+
+    $album_image_style = NULL;
+    $album_thumbnail_style = NULL;
+    if (isset($this->groupingConfigService)) {
+      $album_image_style = $this->groupingConfigService->getNodeImageStyleConfig($parent_entity);
+      $album_thumbnail_style = $this->groupingConfigService->getNodeThumbnailStyleConfig($parent_entity);
+    }
+
+    // Construction des données média.
+    $medias      = [];
+    $first_media = NULL;
+
+    foreach ($media_entities as $media) {
+      if (!$first_media) {
+        $first_media = $media;
+      }
+      $source_field = $this->getSourceField($media);
+      if (!$source_field) {
+        continue;
+      }
+      $media_data = $this->buildMediaItemData($media, $source_field, $album_image_style, $album_thumbnail_style);
+      if ($media_data) {
+        if (!empty($media_caption_config)) {
+          $media_caption = $this->resolveCaptionValue($media, $media_caption_config);
+          if ($media_caption !== '') {
+            // Keep compatibility with existing Twig that reads media.description.
+            // @todo refactor Twig to read media.caption and remove this duplication.
+            $media_data['description'] = $media_caption;
+            $media_data['caption'] = $media_caption;
+          }
+        }
+        $medias[] = $media_data;
+      }
+    }
+
+    if (empty($medias) || !$first_media) {
+      return NULL;
+    }
+
+    $album_id = 'album-group-' . $group_index;
+
+    return [
+      'id'           => $album_id,
+      'image_url'    => $medias[0]['thumbnail'] ?? $medias[0]['url'] ?? '',
+      'image_url_id' => $medias[0]['media_id'] ?? '',
+      'title'        => $title,
+      'author'       => $author,
+      'description'  => $description,
+      'caption'      => $caption,
+      'url'          => '',
+      'medias'       => $medias,
+      'nid'          => $parent_entity->id(),
+    ];
+  }
+
+  /**
+   * Build album data from a row.
+   *
+   * @param object $row
+   *   The view row (ResultRow).
+   * @param int $index
+   *   The row index.
+   * @param array $album_group_settings
+   *   The album settings (passed by reference to collect).
+   *
+   * @return array|null
+   *   The album data or NULL on error.
+   */
+  private function buildAlbumData($row, $index, array &$album_group_settings) {
+    $this->view->row_index = $index;
+
+    // Get the media entity from the row.
+    $media = NULL;
+
+    // Vérifier d'abord si le média est dans _relationship_entities (nouvelle structure)
+    if (isset($row->_relationship_entities) && is_array($row->_relationship_entities)) {
+      // Chercher le champ de relationship (ex: field_media_album_av_media)
+      foreach ($row->_relationship_entities as $rel_field => $rel_entity) {
+        if ($rel_entity instanceof MediaInterface) {
+          $media = $rel_entity;
+          break;
+        }
+      }
+    }
+
+    // Fallback: ancienne structure où le média était dans _entity.
+    if (!$media && isset($row->_entity) && $row->_entity instanceof MediaInterface) {
+      $media = $row->_entity;
+    }
+
+    if (!$media) {
+      \Drupal::logger('album_gallery')->warning('No media entity found in row @index', ['@index' => $index]);
+      return NULL;
+    }
+
+    // Get source field for this media.
+    $source_field = $this->getSourceField($media);
+    if (!$source_field) {
+      \Drupal::logger('album_gallery')->warning('No source field found for media @id', ['@id' => $media->id()]);
+      return NULL;
+    }
+
+    // Text fields from the view row.
+    $title = !empty($this->options['image']['title_field'])
+    ? $this->getFieldValue($index, $this->options['image']['title_field'])
+    : '';
+    $author = !empty($this->options['image']['author_field'])
+    ? $this->getFieldValue($index, $this->options['image']['author_field'])
+    : '';
+    $description = !empty($this->options['image']['description_field'])
+    ? $this->getFieldValue($index, $this->options['image']['description_field'])
+    : '';
+
+    // Build media item data based on type.
+    $media_data = $this->buildMediaItemData($media, $source_field);
+
+    if (!$media_data) {
+      \Drupal::logger('album_gallery')->warning('Failed to build media data for media @id', ['@id' => $media->id()]);
+      return NULL;
+    }
+
+    // Use the first media item's thumbnail as the album image.
+    $image_url = $media_data['thumbnail'] ?? $media_data['url'] ?? '';
+
+    $album_id = 'album-item-' . $media->id() . '-' . $index;
+
+    return [
+      'id' => $album_id,
+      'image_url' => $image_url,
+      'title' => $title,
+      'author' => $author,
+      'description' => $description,
+    // Pas d'URL de node dans ce contexte.
+      'url' => '',
+    // Un seul média par row.
+      'medias' => [$media_data],
+    ];
+  }
+
+  /**
+   * Get the author name from a node entity.
+   *
+   * Reads the configured author_field from the entity when available,
+   * otherwise falls back to the node owner's display name.
+   *
+   * @param \Drupal\Core\Entity\EntityInterface $entity
+   *   The entity to read the author from.
+   *
+   * @return string
+   *   The author name, or an empty string if not available.
+   */
+  private function getNodeAuthors(EntityInterface $entity): string {
+    $author_field = $this->options['image']['author_field'] ?? NULL;
+    if (!empty($author_field) && $entity->hasField($author_field)) {
+      $field = $entity->get($author_field);
+      if (!$field->isEmpty()) {
+        $first_item = $field->first();
+        // Handle entity reference fields (e.g. user reference).
+        if (method_exists($first_item, 'entity') && $first_item->entity) {
+          return $first_item->entity->label() ?? '';
+        }
+        return (string) ($first_item->value ?? '');
+      }
+    }
+    // Fallback: use the entity owner's display name.
+    if (method_exists($entity, 'getOwner')) {
+      return $entity->getOwner()->getDisplayName() ?? '';
+    }
+    return '';
+  }
+
+  /**
+   * Build media item data for a single media entity.
+   *
+   * @param \Drupal\media\MediaInterface $media
+   *   The media entity.
+   * @param string $source_field
+   *   The source field name.
+    * @param string|null $image_style_name
+    *   Full image style name from per-album configuration.
+    * @param string|null $thumbnail_style_name
+    *   Thumbnail style name from per-album configuration.
+   *
+   * @return array|null
+   *   The media item data or NULL on error.
+   */
+  private function buildMediaItemData(MediaInterface $media, string $source_field, ?string $image_style_name = NULL, ?string $thumbnail_style_name = NULL): ?array {
+    $plugin_id = $media->getSource()->getPluginId();
+
+    switch ($plugin_id) {
+      case 'image':
+        // Seuls champs nécessaires : le source field (fid + alt + title)
+        if ($media->get($source_field)->isEmpty()) {
+          return NULL;
+        }
+        $item = $media->get($source_field)->first();
+        $file = $item->entity;
+        if (!$file instanceof FileInterface) {
+          return NULL;
+        }
+
+        $uri = $file->getFileUri();
+        $original_url = $this->fileUrlGenerator->generateAbsoluteString($uri);
+        $thumbnail_url = $this->buildStyledUrl($uri, $original_url, $thumbnail_style_name);
+
+        return [
+          // 'url'       => $original_url,
+          'url'       => $this->buildImageUrl($uri, $original_url, $image_style_name),
+          'mime_type' => $file->getMimeType(),
+          'alt'       => $item->get('alt')->getValue() ?? '',
+          'title'     => $item->get('title')->getValue() ?? '',
+          'thumbnail' => $thumbnail_url,
+          'media_id'  => $media->id(),
+          'loading'   => 'lazy',
+        ];
+
+      case 'video_file':
+        if ($media->get($source_field)->isEmpty()) {
+          return NULL;
+        }
+        $file = $media->get($source_field)->entity;
+        if (!$file instanceof FileInterface) {
+          return NULL;
+        }
+
+        // Thumbnail : uniquement le champ 'thumbnail', pas de rendu complet.
+        $thumbnail_url = $this->buildVideoThumbnailUrl($media, $thumbnail_style_name);
+
+        return [
+          'url'       => $this->fileUrlGenerator->generateAbsoluteString($file->getFileUri()),
+          'mime_type' => $file->getMimeType(),
+          'thumbnail' => $thumbnail_url,
+          'title'     => $media->get($source_field)->first()->get('description')->getValue() ?? '',
+          'media_id'  => $media->id(),
+          'loading'   => 'lazy',
+          'preload'   => 'none',
+        ];
+    }
+
+    return NULL;
+  }
+
+  /**
+   * Factorise la génération d'URL stylisée pour éviter la duplication.
+   */
+  private function buildStyledUrl(string $uri, string $fallback, ?string $style_name = NULL): string {
+    if ($style_name === NULL) {
+      // Keep compatibility with old Views style option.
+      $style_name = $this->options['image']['image_thumbnail_style'] ?? '';
+    }
+    if (!$style_name) {
+      return $fallback;
+    }
+    try {
+      $style = ImageStyle::load($style_name);
+      return $style ? $style->buildUrl($uri) : $fallback;
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('album_gallery')->error('Image style error: @e', ['@e' => $e->getMessage()]);
+      return $fallback;
+    }
+  }
+
+  /**
+   * Factorise la génération d'URL stylisée pour éviter la duplication.
+   */
+  private function buildImageUrl(string $uri, string $fallback, ?string $style_name = NULL): string {
+    if ($style_name === NULL) {
+      // Legacy fallback for displays not using per-album configuration.
+      $style_name = 'media_album_av';
+    }
+    if (!$style_name) {
+      return $fallback;
+    }
+    try {
+      $style = ImageStyle::load($style_name);
+      return $style ? $style->buildUrl($uri) : $fallback;
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('album_gallery')->error('Image style error: @e', ['@e' => $e->getMessage()]);
+      return $fallback;
+    }
+  }
+
+  /**
+   * Resolve the caption value from an entity using a caption field config.
+   *
+   * @param \Drupal\Core\Entity\EntityInterface $entity
+   *   The entity to read the caption from.
+   * @param string $caption_config
+   *   Caption field config in format "type|field_name" or plain "field_name".
+   *
+   * @return string
+   *   The resolved caption value, or empty string.
+   */
+  private function resolveCaptionValue(EntityInterface $entity, string $caption_config): string {
+    if (empty($caption_config)) {
+      return '';
+    }
+
+    // Parse "type|field_name" or plain "field_name".
+    if (str_contains($caption_config, '|')) {
+      [, $field_name] = explode('|', $caption_config, 2);
+    }
+    else {
+      $field_name = $caption_config;
+    }
+
+    if (empty($field_name) || !$entity->hasField($field_name)) {
+      return '';
+    }
+
+    $field = $entity->get($field_name);
+    if ($field->isEmpty()) {
+      return '';
+    }
+
+    $first = $field->first();
+    // Entity reference (taxonomy term): return label.
+    if (method_exists($first, 'entity') && $first->entity) {
+      return (string) ($first->entity->label() ?? '');
+    }
+    // Date field: format the date value.
+    if (isset($first->value) && ($first instanceof DateTimeItem)) {
+      // @todo gérer les formats de date configurables, pas juste d/m/Y.
+      return $first->date->format('d/m/Y') ?? '';
+    }
+    // Text / string fields.
+    return (string) ($first->value ?? '');
+  }
+
+  /**
+   *
+   */
+  private function buildVideoThumbnailUrl(MediaInterface $media, ?string $thumbnail_style_name = NULL): string {
+    if ($media->get('thumbnail')->isEmpty()) {
+      return $this->getDefaultImageUrl('Video_error.png');
+    }
+    $thumbnail = $media->get('thumbnail')->entity;
+    if (!$thumbnail instanceof FileInterface) {
+      return $this->getDefaultImageUrl('Video_error.png');
+    }
+    return $this->buildStyledUrl(
+        $thumbnail->getFileUri(),
+      $this->fileUrlGenerator->generateAbsoluteString($thumbnail->getFileUri()),
+      $thumbnail_style_name
+    );
+  }
+
+  
+
+  /**
+   * Retrieves the source field configuration from the media entity's source plugin.
+   *
+   * Logs a warning and skips processing if the source_field
+   * configuration is missing.
+   *
+   * @param \Drupal\media\MediaInterface $media
+   *   The media entity being processed.
+   *
+   * @return string|null
+   *   The source field name or NULL if not found.
+   */
+  private function getSourceField($media) {
+    try {
+      if (!$media instanceof MediaInterface) {
+        \Drupal::logger('album_gallery')->warning('Invalid media entity provided.');
+        return NULL;
+      }
+      $source = $media->getSource();
+      if (!$source) {
+        \Drupal::logger('album_gallery')->warning('Media entity @id has no source plugin.', ['@id' => $media->id()]);
+        return NULL;
+      }
+      $source_config = $media->getSource()->getConfiguration();
+      $source_field = $source_config['source_field'] ?? NULL;
+      if (!$source_field) {
+        \Drupal::logger('album_gallery')->warning('Media entity @id is missing a source_field configuration.', ['@id' => $media->id()]);
+      }
+      return $source_field;
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('album_gallery')->error('Error retrieving source field for media @id: @error', ['@id' => $media->id(), '@error' => $e->getMessage()]);
+      return NULL;
+    }
+  }
+
+  /**
+   * Get media image URL.
+   */
+  protected function getMediaImageUrl($row, $field_name) {
+    if (empty($field_name)) {
+      return '';
+    }
+
+    if (!isset($row->_entity) || !$row->_entity instanceof EntityInterface) {
+      return '';
+    }
+
+    $source_field = $this->getSourceField($row->_entity->get($field_name)->entity);
+    if (!$source_field) {
+      \Drupal::logger('album_gallery')->warning('Media @media does not have a valid source field.', ['@media' => $row->_entity->id()]);
+      return '';
+    }
+
+    try {
+      $media_item = $row->_entity->get($field_name)->entity ?? NULL;
+      if ($media_item instanceof MediaInterface) {
+        switch ($media_item->getSource()->getPluginId()) {
+          case 'image':
+            if ($media_item->hasField($source_field) && !$media_item->get($source_field)->isEmpty()) {
+              $file = $media_item->get($source_field)->entity;
+              if ($file) {
+                // Vérifier si un style d'image est défini dans les options.
+                if (!empty($this->options['image']['image_thumbnail_style'])) {
+                  $image_style = ImageStyle::load($this->options['image']['image_thumbnail_style']);
+                  if ($image_style) {
+                    // Générer l'URL avec le style d'image.
+                    return $image_style->buildUrl($file->getFileUri());
+                  }
+                }
+                // Fallback: URL originale si aucun style n'est défini.
+                return $this->fileUrlGenerator->generateAbsoluteString($file->getFileUri());
+              }
+              else {
+                return $this->getDefaultImageUrl('Document_error.png');
+              }
+            }
+            break;
+
+          case 'video_file':
+            if ($media_item->hasField($source_field) && !$media_item->get($source_field)->isEmpty()) {
+              $thumbnail = $media_item->get('thumbnail')->entity;
+              if ($thumbnail && $thumbnail instanceof FileInterface) {
+                // Appliquer aussi le style aux miniatures vidéo si besoin.
+                if (!empty($this->options['image']['image_thumbnail_style'])) {
+                  $image_style = ImageStyle::load($this->options['image']['image_thumbnail_style']);
+                  if ($image_style) {
+                    return $image_style->buildUrl($thumbnail->getFileUri());
+                  }
+                }
+                return $this->fileUrlGenerator->generateAbsoluteString($thumbnail->getFileUri());
+              }
+              else {
+                return $this->getDefaultImageUrl('Video_error.png');
+              }
+            }
+            else {
+              return $this->getDefaultImageUrl('Video.png');
+            }
+            break;
+        }
+      }
+    }
+    catch (\Exception $e) {
+      \Drupal::logger('album_gallery')->error('Media field error: @error', ['@error' => $e->getMessage()]);
+    }
+
+    return '';
+  }
+
+  /**
+   * Helper method to get default image URLs.
+   */
+  protected function getDefaultImageUrl($filename) {
+    return \Drupal::request()->getSchemeAndHttpHost() . '/' .
+            \Drupal::service('extension.list.module')->getPath('media_album_fancybox') .
+            '/images/' . $filename;
+  }
+
+  /**
+   *
+   */
+  protected function getTextAndMediaFields() {
+    $text_fields = [];
+    $media_fields = [];
+    $taxo_fields = [];
+
+    /* ********************************* */
+    $field_manager = \Drupal::service('entity_field.manager');
+    $handlers = $this->displayHandler->getHandlers('field');
+    $relationships = $this->displayHandler->getHandlers('relationship');
+
+    // 1. Type d'entité de base de la vue
+    $base_entity_type = $this->view->getBaseEntityType()->id();
+
+    // 2. Parcourir les champs
+    foreach ($handlers as $field_id => $handler) {
+      if (!($handler instanceof EntityField)) {
+        continue;
+      }
+
+      $field_system_name = $handler->field;
+      $field_label = $handler->label();
+      $field_name = $handler->definition['title'] ?? $field_system_name;
+
+      // 3. Déterminer l'entité source du champ
+      $entity_type_id = $base_entity_type;
+      $relationship_id = $handler->options['relationship'] ?? 'none';
+
+      \Drupal::logger('album_fancybox')->info('Traitement champ @field_id (@field_name)', [
+        '@field_id' => $field_id,
+        '@field_name' => $field_system_name,
+      ]);
+
+      if ($relationship_id !== 'none' && isset($relationships[$relationship_id])) {
+        \Drupal::logger('album_fancybox')->info('RELATIONSHIP détectée: @rel_id', ['@rel_id' => $relationship_id]);
+
+        $relationship = $relationships[$relationship_id];
+
+        // IMPORTANT: Le champ du handler ($handler->field) est déjà le bon nom
+        // C'est la RELATIONSHIP qui porte la référence à l'entité cible.
+        // 1. Récupérer l'entity type CIBLE de la relationship
+        // La relationship définit vers quel type d'entité elle pointe.
+        $relationship_definition = $relationship->definition;
+
+        \Drupal::logger('album_fancybox')->info('Relationship definition: @def', [
+          '@def' => json_encode($relationship_definition),
+        ]);
+
+        // Méthode 1 : Via la base table de la relationship.
+        if (isset($relationship_definition['relationship']['base'])) {
+          $base_table = $relationship_definition['relationship']['base'];
+
+          \Drupal::logger('album_fancybox')->info('Base table trouvée: @table', ['@table' => $base_table]);
+
+          // Extraire l'entity type depuis la table.
+          if (preg_match('/^([a-z_]+)_field_data$/', $base_table, $matches)) {
+            // 'media', 'node', 'user', etc.
+            $target_entity_type = $matches[1];
+            \Drupal::logger('album_fancybox')->info('Entity type extrait via regex 1: @type', ['@type' => $target_entity_type]);
+          }
+          elseif (preg_match('/^([a-z_]+)__/', $base_table, $matches)) {
+            $target_entity_type = $matches[1];
+            \Drupal::logger('album_fancybox')->info('Entity type extrait via regex 2: @type', ['@type' => $target_entity_type]);
+          }
+          else {
+            // Table mapping pour les cas standards.
+            $table_map = [
+              'media_field_data' => 'media',
+              'node_field_data' => 'node',
+              'users_field_data' => 'user',
+              'taxonomy_term_field_data' => 'taxonomy_term',
+              'file_managed' => 'file',
+            ];
+            $target_entity_type = $table_map[$base_table] ?? NULL;
+            \Drupal::logger('album_fancybox')->info('Entity type via table_map: @type (NULL si non trouvé)', ['@type' => $target_entity_type ?? 'NULL']);
+          }
+        }
+        else {
+          \Drupal::logger('album_fancybox')->warning('Base table NOT FOUND in relationship definition');
+        }
+
+        // Méthode 2 : Via la configuration du champ d'entity_reference.
+        if (!isset($target_entity_type)) {
+          \Drupal::logger('album_fancybox')->info('Entity type non trouvé via Méthode 1, essai Méthode 2 (field configuration)');
+
+          // Extraire le nom du champ depuis la table de la relationship.
+          // Format standard: {entity_type}__{field_name} ou {entity_type}_field_{field_name}
+          // Ex: node__field_media_album_av_media.
+          $relationship_table = $relationship->table;
+          \Drupal::logger('album_fancybox')->info('Relationship table: @table', ['@table' => $relationship_table]);
+
+          $relationship_field_name = NULL;
+
+          // Pattern 1: entity__field_name (champs multi-value)
+          if (preg_match('/^([a-z_]+)__(.+)$/', $relationship_table, $matches)) {
+            $relationship_field_name = $matches[2];
+            \Drupal::logger('album_fancybox')->info('Field name extrait du pattern multi-value: @fname', ['@fname' => $relationship_field_name]);
+          }
+          // Pattern 2: entity_field_name (champs single-value dans les anciennes versions)
+          elseif (preg_match('/^([a-z_]+)_field_(.+)$/', $relationship_table, $matches)) {
+            $relationship_field_name = 'field_' . $matches[2];
+            \Drupal::logger('album_fancybox')->info('Field name extrait du pattern single-value: @fname', ['@fname' => $relationship_field_name]);
+          }
+
+          if ($relationship_field_name) {
+            $base_field_storages = $field_manager->getFieldStorageDefinitions($base_entity_type);
+
+            \Drupal::logger('album_fancybox')->info('Recherche du champ @fname dans @entity_type', [
+              '@fname' => $relationship_field_name,
+              '@entity_type' => $base_entity_type,
+            ]);
+
+            if (isset($base_field_storages[$relationship_field_name])) {
+              $rel_field_storage = $base_field_storages[$relationship_field_name];
+              $rel_field_type = $rel_field_storage->getType();
+              $rel_field_settings = $rel_field_storage->getSettings();
+
+              \Drupal::logger('album_fancybox')->info('Relationship field type: @type, settings: @settings', [
+                '@type' => $rel_field_type,
+                '@settings' => json_encode($rel_field_settings),
+              ]);
+
+              // Si c'est un entity_reference, extraire le target_type.
+              if ($rel_field_type === 'entity_reference' && isset($rel_field_settings['target_type'])) {
+                $target_entity_type = $rel_field_settings['target_type'];
+                \Drupal::logger('album_fancybox')->info('✓ Target entity type extrait du champ: @type', ['@type' => $target_entity_type]);
+              }
+              else {
+                \Drupal::logger('album_fancybox')->warning('Field @fname n\'est pas un entity_reference ou n\'a pas de target_type', ['@fname' => $relationship_field_name]);
+              }
+            }
+            else {
+              \Drupal::logger('album_fancybox')->warning('Field @fname NOT FOUND dans @entity_type', [
+                '@fname' => $relationship_field_name,
+                '@entity_type' => $base_entity_type,
+              ]);
+            }
+          }
+          else {
+            \Drupal::logger('album_fancybox')->warning('Impossible d\'extraire le field name depuis la table: @table', ['@table' => $relationship_table]);
+          }
+        }
+
+        // Méthode 3 : Via views_data en dernier recours.
+        if (!isset($target_entity_type)) {
+          \Drupal::logger('album_fancybox')->info('Entity type non trouvé via Méthode 2, essai Méthode 3 (views_data)');
+
+          $views_data = \Drupal::service('views.views_data');
+          $relationship_table = $relationship->table;
+          \Drupal::logger('album_fancybox')->info('Relationship table: @table', ['@table' => $relationship_table]);
+
+          $table_data = $views_data->get($relationship_table);
+
+          if ($table_data && isset($table_data['table']['entity type'])) {
+            $target_entity_type = $table_data['table']['entity type'];
+            \Drupal::logger('album_fancybox')->info('Entity type trouvé via views_data: @type', ['@type' => $target_entity_type]);
+          }
+          else {
+            \Drupal::logger('album_fancybox')->warning('Entity type NOT FOUND via views_data');
+          }
+        }
+
+        // 2. Le champ à chercher est celui du HANDLER, pas de la relationship
+        $field_system_name = $handler->field;
+
+        // 3. Récupérer les field storages de l'entité CIBLE
+        if (isset($target_entity_type)) {
+          \Drupal::logger('album_fancybox')->info('Chargement field storages pour entity type: @type', ['@type' => $target_entity_type]);
+
+          $field_storages = $field_manager->getFieldStorageDefinitions($target_entity_type);
+
+          \Drupal::logger('album_fancybox')->info('Field storages chargées. Recherche du champ: @field', ['@field' => $field_system_name]);
+
+          if (isset($field_storages[$field_system_name])) {
+            \Drupal::logger('album_fancybox')->info('✓ Champ @field TROUVÉ dans entity type @type', [
+              '@field' => $field_system_name,
+              '@type' => $target_entity_type,
+            ]);
+          }
+          else {
+            \Drupal::logger('album_fancybox')->warning('✗ Champ @field NOT FOUND dans entity type @type. Champs disponibles: @fields', [
+              '@field' => $field_system_name,
+              '@type' => $target_entity_type,
+              '@fields' => implode(', ', array_keys($field_storages)),
+            ]);
+          }
+        }
+        else {
+          \Drupal::logger('album_fancybox')->error('ERREUR: target_entity_type non défini (les trois méthodes ont échoué)');
+        }
+      }
+      // Si pas de relationship, on utilise l'entité de base.
+      else {
+        if ($relationship_id !== 'none') {
+          \Drupal::logger('album_fancybox')->warning('Relationship @rel_id spécifiée mais NOT FOUND', ['@rel_id' => $relationship_id]);
+        }
+
+        \Drupal::logger('album_fancybox')->info('Pas de relationship, utilisation entity type de base: @type', ['@type' => $entity_type_id]);
+
+        $field_storages = $field_manager->getFieldStorageDefinitions($entity_type_id);
+      }
+
+      if (isset($field_storages[$field_system_name])) {
+        $field_storage = $field_storages[$field_system_name];
+        $field_type = $field_storage->getType();
+        $settings = $field_storage->getSettings();
+
+        if (in_array($field_type, ['string', 'text', 'text_long', 'text_with_summary'])) {
+          $text_fields[$field_system_name] = (string) $field_name;
+        }
+        elseif (
+              $field_type === 'entity_reference' &&
+              $settings['target_type'] === 'media'
+          ) {
+          $media_fields[$field_system_name] = (string) $field_name;
+        }
+        elseif (
+              $field_type === 'entity_reference' &&
+              $settings['target_type'] === 'taxonomy_term'
+          ) {
+          $taxo_fields[$field_system_name] = (string) $field_name;
+        }
+      }
+      /*
+      $field_options[$field_id] = [
+      'label' => $field_label,
+      'system_name' => $field_system_name,
+      'type' => $field_type,
+      'entity_type' => $entity_type_id,
+      'relationship' => $relationship_id,
+      'settings' => $settings,
+      ];
+
+      // Pour les entity_reference.
+      if ($field_type === 'entity_reference') {
+      $field_options[$field_id]['target_type'] = $settings['target_type'] ?? NULL;
+      }
+       */
+    }
+    /* ********************************* */
+    return [$text_fields, $media_fields, $taxo_fields];
+
+    $entity_type_id = $view->getBaseEntityType()->id();
+    // Retreive bundle from view filters options.
+    $bundle = $view->display_handler->getOption('filters')['type']['value'] ?? NULL;
+    if (is_array($bundle)) {
+      $bundle = reset($bundle);
+    }
+
+    // 2. load field definitions for the entity and bundle.
+    $field_definitions = \Drupal::service('entity_field.manager')->getFieldDefinitions($entity_type_id, $bundle);
+
+    // 3. Browse fields in the view and match with definitions.
+    foreach ($view->display_handler->getHandlers('field') as $field_id => $handler) {
+      $field_name = $handler->field ?? NULL;
+      if ($field_name && isset($field_definitions[$field_name])) {
+        $field_def = $field_definitions[$field_name];
+        $type = $field_def->getType();
+
+        // 4. test field type.
+        if (in_array($type, ['string', 'text', 'text_long', 'text_with_summary'])) {
+          $text_fields[$field_name] = (string) $field_def->getLabel();
+        }
+        elseif (
+              $type === 'entity_reference' &&
+              $field_def->getSetting('target_type') === 'media'
+          ) {
+          $media_fields[$field_name] = (string) $field_def->getLabel();
+        }
+        elseif (
+              $type === 'entity_reference' &&
+              $field_def->getSetting('target_type') === 'taxonomy_term'
+          ) {
+          $taxo_fields[$field_name] = (string) $field_def->getLabel();
+        }
+      }
+      else {
+        // Pas de fieldDefinition → champ calculé ou relation virtuelle
+        // On peut essayer de deviner à partir du plugin_id ou table.
+        $plugin_id = $handler->getPluginId();
+
+        if (in_array($plugin_id, ['entity_reference_label'])) {
+          $taxo_fields[$field_name] = $handler->adminLabel() ?: $field_name;
+        }
+        elseif (in_array($plugin_id, ['field', 'media_album_av_unified_media'])) {
+          $media_fields[$field_name] = $handler->adminLabel() ?: $field_name;
+        }
+        else {
+          // Par défaut, on peut le considérer comme texte.
+          $text_fields[$field_name] = $handler->adminLabel() ?: $field_name;
+        }
+      }
+    }
+
+    return [$text_fields, $media_fields, $taxo_fields];
+  }
+
+  /**
+   * Retreives text, taxonomy, media, and number fields from the view.
+   *
+   * @param bool $hidden
+   *   Whether to include hidden fields.
+   *   True to exclude hidden fields.
+   *
+   * @return array
+   *   An array containing arrays of text fields, media fields, taxonomy fields, and number
+   */
+  protected function getTextAndMediaFieldsCentric($hidden = FALSE) {
+
+    $a = $this->getAvailableFields($hidden);
+    // Récupérer tous les champs de la vue.
+    $fields = $this->displayHandler->getHandlers('field');
+
+    // Préparer les options pour les champs texte.
+    $text_fields = [];
+    $taxonomy_fields = [];
+    $media_fields = [];
+    $number_fields = [];
+
+    foreach ($fields as $field_name => $field) {
+
+      $is_excluded = $hidden && !empty($field->options['exclude']);
+
+      if ($is_excluded) {
+        continue;
+      }
+
+      $label = $field->adminLabel() ?: $field_name;
+
+      // Identifier le type de champ.
+      $plugin_id = $field->getPluginId();
+      $field_definition = $field->definition ?? [];
+      $field_identifier = $field->field ?? NULL;
+
+      // Champs de base de l'entité media (name, created, etc.)
+      // On vérifie le nom du champ dans la table.
+      if (isset($field->table) && $field->table === 'media_field_data') {
+        // Champ name (titre du media)
+        if ($field_identifier === 'name') {
+          $text_fields[$field_name] = [
+            'label' => $label,
+            'excluded' => $is_excluded,
+          ];
+        }
+      }
+      // Champs texte.
+      if (in_array($plugin_id, ['field']) && isset($field->definition['field_name'])) {
+        $field_storage_config = \Drupal::entityTypeManager()
+          ->getStorage('field_storage_config')
+          ->load('media.' . $field->definition['field_name']);
+
+        if ($field_storage_config) {
+          $field_type = $field_storage_config->getType();
+
+          switch ($field_type) {
+            case 'string':
+            case 'string_long':
+            case 'text':
+            case 'text_long':
+            case 'text_with_summary':
+              $text_fields[$field_name] = $label;
+              break;
+
+            case 'entity_reference':
+              // Vérifier si c'est une taxonomie.
+              $settings = $field_storage_config->getSettings();
+              if (isset($settings['target_type']) && $settings['target_type'] === 'taxonomy_term') {
+                $taxonomy_fields[$field_name] = $label;
+              }
+              break;
+
+            case 'integer':
+            case 'decimal':
+            case 'float':
+              $number_fields[$field_name] = $label;
+              break;
+
+            case 'image':
+            case 'file':
+              $media_fields[$field_name] = $label;
+              break;
+          }
+        }
+      }
+
+      // Champs spéciaux (comme votre media_album_av_unified_media)
+      if ($plugin_id === 'media_album_av_unified_media') {
+        $media_fields[$field_name] = $label;
+      }
+
+      // Champs de type entity_reference_label (taxonomies)
+      if ($plugin_id === 'entity_reference_label') {
+        $taxonomy_fields[$field_name] = $label;
+      }
+
+      // Champs de type number.
+      if ($plugin_id === 'number_integer' || $plugin_id === 'number_decimal') {
+        $number_fields[$field_name] = $label;
+      }
+    }
+    return [$text_fields, $media_fields, $taxonomy_fields, $number_fields];
+  }
+
+  /**
+   *
+   */
+  public function getAvailableFields(bool $hidden = FALSE): array {
+
+    $handlers = $this->displayHandler->getHandlers('field');
+
+    foreach ($handlers as $field_name => $handler) {
+      $a = $this->getFieldInfo($handler);
+    }
+
+    $out = [
+      'text' => [],
+      'media' => [],
+      'taxonomy' => [],
+      'number' => [],
+      'date' => [],
+    ];
+
+    return $out;
+  }
+
+  /**
+   *
+   */
+  protected function getFieldInfo(EntityField $entityField) {
+    $field_name = $entityField->field;
+    $entity_type = $entityField->getEntityType();
+
+    // Récupérer la définition du stockage du champ.
+    $field_storage = FieldStorageConfig::loadByName($entity_type, $field_name);
+
+    if ($field_storage) {
+      return [
+        'name' => $field_name,
+        'type' => $field_storage->getType(),
+        'entity_type' => $entity_type,
+        'settings' => $field_storage->getSettings(),
+        'cardinality' => $field_storage->getCardinality(),
+      ];
+    }
+
+    return NULL;
+  }
+
+  /**
+   * Retrieves the value of a field for a specific row in the view.
+   *
+   * @param int $index
+   *   The row index.
+   * @param string $field
+   *   The field name.
+   *
+   * @return mixed
+   *   The field value.
+   */
+
+  /**
+   * Version corrigée de getFieldValue pour fonctionner sans rendu Views.
+   *
+   * Cherche la valeur dans l'entité de base, puis dans les entités de
+   * relationship (média via JOIN), puis en dernier recours via le handler
+   * Views.
+   */
+  public function getFieldValue($index, $field) {
+    $row = $this->view->result[$index] ?? NULL;
+    if (!$row) {
+      return '';
+    }
+
+    // 1. Entité de base (node).
+    if (isset($row->_entity) && $row->_entity->hasField($field)) {
+      $items = $row->_entity->get($field);
+      if (!$items->isEmpty()) {
+        $val = $items->first()->getValue();
+        return $val['value'] ?? $val['target_id'] ?? '';
+      }
+    }
+
+    // 2. Entités de relationship (ex : média via JOIN).
+    if (isset($row->_relationship_entities) && is_array($row->_relationship_entities)) {
+      foreach ($row->_relationship_entities as $rel_entity) {
+        if ($rel_entity instanceof EntityInterface && $rel_entity->hasField($field)) {
+          $items = $rel_entity->get($field);
+          if (!$items->isEmpty()) {
+            $val = $items->first()->getValue();
+            return $val['value'] ?? $val['target_id'] ?? '';
+          }
+        }
+      }
+    }
+
+    // 3. Fallback : handler Views (getValue sans rendu complet).
+    if (isset($this->view->field[$field])) {
+      $this->view->row_index = $index;
+      $value = $this->view->field[$field]->getValue($row);
+      $this->view->row_index = NULL;
+      return $value;
+    }
+
+    return '';
+  }
+
+  /**
+   * Résout récursivement les clés de groupement brutes en labels lisibles.
+   * Nécessaire quand renderGrouping() est appelé avec rendered=FALSE :
+   * les IDs de termes taxo sont alors utilisés comme clés de groupement.
+   */
+  private function resolveGroupLabels(array $groups): array {
+    $term_storage = \Drupal::entityTypeManager()->getStorage('taxonomy_term');
+    // Collecter tous les IDs numériques pour un loadMultiple() unique.
+    $term_ids = [];
+    array_walk_recursive($groups, function ($val, $key) use (&$term_ids) {
+      if ($key === 'group' && is_numeric($val) && $val > 0) {
+        $term_ids[(int) $val] = (int) $val;
+      }
+    });
+
+    $terms = !empty($term_ids) ? $term_storage->loadMultiple($term_ids) : [];
+
+    $resolve = function (array $groups) use (&$resolve, $terms): array {
+      foreach ($groups as &$group) {
+        $raw = $group['group'] ?? NULL;
+        if (is_numeric($raw) && isset($terms[(int) $raw])) {
+          $group['group'] = $terms[(int) $raw]->label();
+        }
+        if (!empty($group['rows'])) {
+          $first = reset($group['rows']);
+          if (is_array($first) && array_key_exists('rows', $first)) {
+            $group['rows'] = $resolve($group['rows']);
+          }
+        }
+      }
+      return $groups;
+    };
+
+    return $resolve($groups);
+  }
+
+}
