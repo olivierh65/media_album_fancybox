@@ -747,6 +747,20 @@ class AlbumFancyboxGallery extends StylePluginBase {
         $album_medias
         );
       }
+      elseif (!empty($this->options['grouping'])) {
+        // Fallback pour les albums sans configuration de groupement propre
+        // (ex. album_multimedia) : utiliser le groupement défini sur la vue.
+        $album_groups_raw = $this->renderGrouping($rows, $this->options['grouping'], FALSE);
+        $album_groups_raw = $this->resolveGroupLabels($album_groups_raw);
+        $album_groups_processed = $this->processGroupRecursive(
+        $album_groups_raw,
+        $build,
+        $album_settings,
+        0,
+        0,
+        $album_medias
+        );
+      }
       else {
         // Pas de sous-groupement : un seul groupe = tout l'album.
         $album_groups_processed = $this->processGroupRecursive(
